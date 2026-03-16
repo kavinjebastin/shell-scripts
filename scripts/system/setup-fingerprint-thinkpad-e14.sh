@@ -2,7 +2,7 @@
 set -euo pipefail
 
 COMMON_URL="https://raw.githubusercontent.com/kavinjebastin/shell-scripts/main/lib/common.sh"
-LIB_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/lib/common.sh"
+LIB_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)/lib/common.sh"
 if [[ -f "$LIB_PATH" ]]; then
     # shellcheck source=../../lib/common.sh
     source "$LIB_PATH"
