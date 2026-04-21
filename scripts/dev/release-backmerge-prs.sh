@@ -102,7 +102,7 @@ if ! [[ "$CONCURRENCY" =~ ^[0-9]+$ ]] || (( CONCURRENCY < 1 || CONCURRENCY > 20 
     exit 1
 fi
 
-require_cmd az
+require_cmd_installer az https://aka.ms/InstallAzureCLIDeb
 require_cmd jq
 [[ "$SELECTION_MODE" == "pick" ]] && require_cmd fzf
 

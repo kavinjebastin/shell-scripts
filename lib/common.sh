@@ -70,6 +70,28 @@ is_installed() {
     command -v "$1" &>/dev/null
 }
 
+require_cmd_installer() {
+    local cmd="$1" installer_url="$2"
+    if command -v "$cmd" &>/dev/null; then
+        return 0
+    fi
+    if [[ -z "$installer_url" ]]; then
+        error "No installer URL provided for $cmd"
+        exit 1
+    fi
+    info "Installing missing dependency via vendor installer: $cmd"
+    info "Source: $installer_url"
+    if ! curl -fsSL "$installer_url" | sudo bash; then
+        error "Installer failed for $cmd"
+        exit 1
+    fi
+    if ! command -v "$cmd" &>/dev/null; then
+        error "Installer completed but '$cmd' still not found in PATH"
+        exit 1
+    fi
+    success "Installed $cmd"
+}
+
 file_contains() {
     local file="$1" pattern="$2"
     grep -qF "$pattern" "$file" 2>/dev/null
