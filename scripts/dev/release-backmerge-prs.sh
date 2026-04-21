@@ -190,6 +190,23 @@ find_active_pr_id() {
         --query "[0].pullRequestId" -o tsv 2>/dev/null | grep -E '^[0-9]+$' | head -1 || true
 }
 
+has_commits_to_merge() {
+    local repo="$1" source="$2" target="$3"
+    local count
+    count="$(az devops invoke \
+        --organization "$ADO_ORG" \
+        --area git --resource commits \
+        --route-parameters project="$ADO_PROJECT" repositoryId="$repo" \
+        --query-parameters \
+            "searchCriteria.itemVersion.version=$target" \
+            "searchCriteria.itemVersion.versionType=branch" \
+            "searchCriteria.compareVersion.version=$source" \
+            "searchCriteria.compareVersion.versionType=branch" \
+            "\$top=1" \
+        --http-method GET --output json 2>/dev/null | jq -r '.count // 0' 2>/dev/null)"
+    [[ "${count:-0}" -gt 0 ]]
+}
+
 render_title() {
     local source="$1" target="$2"
     local t="$PR_TITLE_TEMPLATE"
@@ -254,6 +271,11 @@ process_pair() {
     if [[ -n "$existing_pr_id" ]]; then
         url="$(build_pr_url "$repo" "$existing_pr_id")"
         echo "EXISTS|$url|PR #$existing_pr_id"
+        return
+    fi
+
+    if ! has_commits_to_merge "$repo" "$source" "$target"; then
+        echo "NO_DIFF||no commits in $source that aren't already in $target"
         return
     fi
 
@@ -371,7 +393,7 @@ if [[ ${#JOBS[@]} -gt 0 ]]; then
     info "Dispatching ${#JOBS[@]} PR job(s) with concurrency $effective_concurrency"
 
     export ADO_ORG ADO_PROJECT DEFAULT_REVIEWERS PR_TITLE_TEMPLATE TODAY DRY_RUN AUTO_COMPLETE
-    export -f build_pr_url branch_exists find_active_pr_id render_title create_backmerge_pr process_pair
+    export -f build_pr_url branch_exists find_active_pr_id has_commits_to_merge render_title create_backmerge_pr process_pair
 
     parallel_out="$(mktemp)"
     trap 'rm -f "$parallel_out"' EXIT
