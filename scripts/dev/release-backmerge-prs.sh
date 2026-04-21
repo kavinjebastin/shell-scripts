@@ -42,10 +42,12 @@ Selection (one required):
   -f, --pick        Multi-select repos with fzf (uses conf source for each)
 
 Options:
-      --skip-dev    Skip all 'dev' targets for this run
+      --skip-dev       Skip all 'dev' targets for this run
+      --auto-complete  Set PRs to auto-complete once policies pass
+                       (keeps source branch, no squash, no bypass)
   -j, --concurrency N  Parallel PR workers (default 6, max 20)
-      --dry-run     Show planned PRs, no writes
-  -h, --help        Show this help
+      --dry-run        Show planned PRs, no writes
+  -h, --help           Show this help
 EOF
     exit "${1:-0}"
 }
@@ -55,6 +57,7 @@ declare -A REPO_SOURCE_OVERRIDES=()
 SELECTION_MODE=""
 SKIP_DEV_CLI=false
 DRY_RUN=false
+AUTO_COMPLETE=false
 CONCURRENCY=6
 
 parse_repo_list() {
@@ -80,7 +83,8 @@ while [[ $# -gt 0 ]]; do
         -r|--repo)     SELECTION_MODE="filter"; parse_repo_list "$2"; shift 2 ;;
         -r=*|--repo=*) SELECTION_MODE="filter"; parse_repo_list "${1#*=}"; shift ;;
         -f|--pick)     SELECTION_MODE="pick"; shift ;;
-        --skip-dev)    SKIP_DEV_CLI=true; shift ;;
+        --skip-dev)      SKIP_DEV_CLI=true; shift ;;
+        --auto-complete) AUTO_COMPLETE=true; shift ;;
         -j|--concurrency)      CONCURRENCY="$2"; shift 2 ;;
         -j=*|--concurrency=*)  CONCURRENCY="${1#*=}"; shift ;;
         --dry-run)     DRY_RUN=true; shift ;;
@@ -208,6 +212,16 @@ create_backmerge_pr() {
         reviewer_args=(--reviewers "${reviewer_list[@]}")
     fi
 
+    local -a ac_args=()
+    if [[ "${AUTO_COMPLETE:-false}" == "true" ]]; then
+        ac_args=(
+            --auto-complete true
+            --delete-source-branch false
+            --squash false
+            --transition-work-items false
+        )
+    fi
+
     az repos pr create \
         --organization "$ADO_ORG" \
         --project "$ADO_PROJECT" \
@@ -217,7 +231,8 @@ create_backmerge_pr() {
         --title "$title" \
         --description "$description" \
         --output json \
-        "${reviewer_args[@]}" 2>&1
+        "${reviewer_args[@]}" \
+        "${ac_args[@]}" 2>&1
 }
 
 # Echoes a single line: status|pr_url|message
@@ -355,7 +370,7 @@ if [[ ${#JOBS[@]} -gt 0 ]]; then
     (( effective_concurrency > ${#JOBS[@]} )) && effective_concurrency=${#JOBS[@]}
     info "Dispatching ${#JOBS[@]} PR job(s) with concurrency $effective_concurrency"
 
-    export ADO_ORG ADO_PROJECT DEFAULT_REVIEWERS PR_TITLE_TEMPLATE TODAY DRY_RUN
+    export ADO_ORG ADO_PROJECT DEFAULT_REVIEWERS PR_TITLE_TEMPLATE TODAY DRY_RUN AUTO_COMPLETE
     export -f build_pr_url branch_exists find_active_pr_id render_title create_backmerge_pr process_pair
 
     parallel_out="$(mktemp)"
