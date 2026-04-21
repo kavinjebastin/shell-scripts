@@ -43,6 +43,7 @@ Selection (one required):
 
 Options:
       --skip-dev    Skip all 'dev' targets for this run
+  -j, --concurrency N  Parallel PR workers (default 6, max 20)
       --dry-run     Show planned PRs, no writes
   -h, --help        Show this help
 EOF
@@ -54,6 +55,7 @@ declare -A REPO_SOURCE_OVERRIDES=()
 SELECTION_MODE=""
 SKIP_DEV_CLI=false
 DRY_RUN=false
+CONCURRENCY=6
 
 parse_repo_list() {
     local list="$1" item name override
@@ -79,6 +81,8 @@ while [[ $# -gt 0 ]]; do
         -r=*|--repo=*) SELECTION_MODE="filter"; parse_repo_list "${1#*=}"; shift ;;
         -f|--pick)     SELECTION_MODE="pick"; shift ;;
         --skip-dev)    SKIP_DEV_CLI=true; shift ;;
+        -j|--concurrency)      CONCURRENCY="$2"; shift 2 ;;
+        -j=*|--concurrency=*)  CONCURRENCY="${1#*=}"; shift ;;
         --dry-run)     DRY_RUN=true; shift ;;
         -h|--help)     usage 0 ;;
         *) error "Unknown option: $1"; usage 1 ;;
@@ -87,6 +91,11 @@ done
 
 if [[ -z "$SELECTION_MODE" ]]; then
     usage 0
+fi
+
+if ! [[ "$CONCURRENCY" =~ ^[0-9]+$ ]] || (( CONCURRENCY < 1 || CONCURRENCY > 20 )); then
+    error "Invalid --concurrency: $CONCURRENCY (must be 1-20)"
+    exit 1
 fi
 
 require_cmd az
@@ -273,6 +282,9 @@ process_pair() {
 }
 
 declare -a RESULTS=()
+declare -a ORDERED=()
+declare -a JOBS=()
+declare -A RESULTS_MAP=()
 total_created=0
 total_conflict=0
 total_exists=0
@@ -295,40 +307,76 @@ for entry in "${REPOS[@]}"; do
         fi
     fi
 
-    info "Processing $repo (source: $source)"
-
     IFS=',' read -ra target_arr <<< "$targets"
     for target in "${target_arr[@]}"; do
-        if [[ "$target" == "$source" ]]; then
-            continue
-        fi
+        [[ "$target" == "$source" ]] && continue
+
+        key="$repo|$source|$target"
+
         if [[ "$target" == "dev" ]]; then
             if [[ "$skip_dev_repo" == "true" ]]; then
-                RESULTS+=("$repo|$source|$target|SKIPPED_DEV_CONFIG||dev disabled per-repo")
-                total_skipped=$((total_skipped + 1))
+                RESULTS_MAP["$key"]="SKIPPED_DEV_CONFIG||dev disabled per-repo"
+                ORDERED+=("$key")
                 continue
             fi
             if [[ "$SKIP_DEV_CLI" == true ]]; then
-                RESULTS+=("$repo|$source|$target|SKIPPED_DEV_RUN||dev skipped for this run")
-                total_skipped=$((total_skipped + 1))
+                RESULTS_MAP["$key"]="SKIPPED_DEV_RUN||dev skipped for this run"
+                ORDERED+=("$key")
                 continue
             fi
         fi
 
-        line="$(process_pair "$repo" "$source" "$target")"
-        IFS='|' read -r status url msg <<< "$line"
-        RESULTS+=("$repo|$source|$target|$status|$url|$msg")
-
-        case "$status" in
-            CREATED)           total_created=$((total_created + 1)) ;;
-            CREATED_CONFLICT)  total_created=$((total_created + 1)); total_conflict=$((total_conflict + 1)) ;;
-            EXISTS)            total_exists=$((total_exists + 1)) ;;
-            NO_DIFF)           total_nodiff=$((total_nodiff + 1)) ;;
-            SKIPPED_*)         total_skipped=$((total_skipped + 1)) ;;
-            DRY_RUN)           total_dryrun=$((total_dryrun + 1)) ;;
-            ERROR)             total_error=$((total_error + 1)) ;;
-        esac
+        ORDERED+=("$key")
+        JOBS+=("$key")
     done
+done
+
+if [[ ${#ORDERED[@]} -eq 0 ]]; then
+    warn "No PR pairs to process"
+    exit 0
+fi
+
+if [[ ${#JOBS[@]} -gt 0 ]]; then
+    effective_concurrency=$CONCURRENCY
+    (( effective_concurrency > ${#JOBS[@]} )) && effective_concurrency=${#JOBS[@]}
+    info "Dispatching ${#JOBS[@]} PR job(s) with concurrency $effective_concurrency"
+
+    export ADO_ORG ADO_PROJECT DEFAULT_REVIEWERS PR_TITLE_TEMPLATE TODAY DRY_RUN
+    export -f build_pr_url branch_exists find_active_pr_id render_title create_backmerge_pr process_pair
+
+    parallel_out="$(mktemp)"
+    trap 'rm -f "$parallel_out"' EXIT
+
+    printf '%s\n' "${JOBS[@]}" | xargs -P "$effective_concurrency" -I {} bash -c '
+        set -uo pipefail
+        IFS="|" read -r repo source target <<< "$1"
+        line="$(process_pair "$repo" "$source" "$target")"
+        printf "%s|%s|%s|%s\n" "$repo" "$source" "$target" "$line"
+    ' _ {} > "$parallel_out"
+
+    while IFS= read -r l; do
+        [[ -z "$l" ]] && continue
+        IFS='|' read -r r s t st u m <<< "$l"
+        RESULTS_MAP["$r|$s|$t"]="$st|$u|$m"
+    done < "$parallel_out"
+
+    rm -f "$parallel_out"
+    trap - EXIT
+fi
+
+for key in "${ORDERED[@]}"; do
+    value="${RESULTS_MAP[$key]:-ERROR||worker produced no result}"
+    RESULTS+=("$key|$value")
+    IFS='|' read -r _ _ _ status _ _ <<< "$key|$value"
+    case "$status" in
+        CREATED)           total_created=$((total_created + 1)) ;;
+        CREATED_CONFLICT)  total_created=$((total_created + 1)); total_conflict=$((total_conflict + 1)) ;;
+        EXISTS)            total_exists=$((total_exists + 1)) ;;
+        NO_DIFF)           total_nodiff=$((total_nodiff + 1)) ;;
+        SKIPPED_*)         total_skipped=$((total_skipped + 1)) ;;
+        DRY_RUN)           total_dryrun=$((total_dryrun + 1)) ;;
+        ERROR)             total_error=$((total_error + 1)) ;;
+    esac
 done
 
 echo ""
