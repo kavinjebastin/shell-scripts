@@ -144,6 +144,20 @@ if [[ "$SELECTION_MODE" == "filter" ]]; then
     done
     if [[ ${#unknown[@]} -gt 0 ]]; then
         error "Unknown repo(s) in --repo: ${unknown[*]}"
+        for u in "${unknown[@]}"; do
+            u_lc="$(echo "$u" | tr '[:upper:]' '[:lower:]')"
+            u_norm="$(echo "$u_lc" | tr -s 'a-z')"
+            suggestion=""
+            for r in "${!CONF_REPO_SET[@]}"; do
+                r_lc="$(echo "$r" | tr '[:upper:]' '[:lower:]')"
+                r_norm="$(echo "$r_lc" | tr -s 'a-z')"
+                if [[ "$u_norm" == "$r_norm" || "$r_lc" == *"$u_lc"* || "$u_lc" == *"$r_lc"* ]]; then
+                    suggestion="$r"
+                    break
+                fi
+            done
+            [[ -n "$suggestion" ]] && error "  did you mean: $suggestion ?"
+        done
         error "Configured repos: ${!CONF_REPO_SET[*]}"
         exit 1
     fi
