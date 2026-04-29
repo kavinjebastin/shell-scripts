@@ -42,9 +42,9 @@ Selection (one required):
   -f, --pick        Multi-select repos with fzf (uses conf source for each)
 
 Options:
-      --skip-dev       Skip all 'dev' targets for this run
-      --auto-complete  Set PRs to auto-complete once policies pass
-                       (keeps source branch, no squash, no bypass)
+      --skip-dev          Skip all 'dev' targets for this run
+      --no-auto-complete  Disable auto-complete (default: on)
+                          Auto-complete keeps source branch, no squash, no bypass
   -j, --concurrency N  Parallel PR workers (default 6, max 20)
       --dry-run        Show planned PRs, no writes
   -h, --help           Show this help
@@ -57,7 +57,7 @@ declare -A REPO_SOURCE_OVERRIDES=()
 SELECTION_MODE=""
 SKIP_DEV_CLI=false
 DRY_RUN=false
-AUTO_COMPLETE=false
+AUTO_COMPLETE=true
 CONCURRENCY=6
 
 parse_repo_list() {
@@ -83,8 +83,9 @@ while [[ $# -gt 0 ]]; do
         -r|--repo)     SELECTION_MODE="filter"; parse_repo_list "$2"; shift 2 ;;
         -r=*|--repo=*) SELECTION_MODE="filter"; parse_repo_list "${1#*=}"; shift ;;
         -f|--pick)     SELECTION_MODE="pick"; shift ;;
-        --skip-dev)      SKIP_DEV_CLI=true; shift ;;
-        --auto-complete) AUTO_COMPLETE=true; shift ;;
+        --skip-dev)         SKIP_DEV_CLI=true; shift ;;
+        --auto-complete)    AUTO_COMPLETE=true; shift ;;
+        --no-auto-complete) AUTO_COMPLETE=false; shift ;;
         -j|--concurrency)      CONCURRENCY="$2"; shift 2 ;;
         -j=*|--concurrency=*)  CONCURRENCY="${1#*=}"; shift ;;
         --dry-run)     DRY_RUN=true; shift ;;
