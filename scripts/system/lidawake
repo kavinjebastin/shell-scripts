@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SELF=$(readlink -f "${BASH_SOURCE[0]}")
+readonly INHIBIT_WHAT='handle-lid-switch:sleep:idle'
+readonly INHIBIT_WHO='lidawake'
+readonly INHIBIT_WHY='lidawake mode: stay connected and keep jobs running with the lid closed'
+readonly STATE_DIR="${XDG_RUNTIME_DIR:-/tmp/lidawake-$UID}/lidawake"
+readonly PID_FILE="$STATE_DIR/holder.pid"
+readonly DEADLINE_FILE="$STATE_DIR/deadline"
+readonly DEFAULT_DURATION='2h'
+
+die() {
+  printf 'lidawake: %s\n' "$1" >&2
+  exit 1
+}
+
+duration_to_seconds() {
+  local spec=$1
+  [[ $spec =~ ^([0-9]+)([smhd]?)$ ]] ||
+    die "invalid duration '$spec' — use 90s, 30m, 2h, 1d, or 0 for no expiry"
+  local value=${BASH_REMATCH[1]} unit=${BASH_REMATCH[2]:-s}
+  case $unit in
+    s) printf '%s' "$value" ;;
+    m) printf '%s' $((value * 60)) ;;
+    h) printf '%s' $((value * 3600)) ;;
+    d) printf '%s' $((value * 86400)) ;;
+  esac
+}
+
+format_seconds() {
+  local total=$1
+  printf '%dh%02dm%02ds' $((total / 3600)) $((total % 3600 / 60)) $((total % 60))
+}
+
+holder_pid() {
+  [[ -r $PID_FILE ]] || return 1
+  local pid
+  pid=$(<"$PID_FILE")
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  [[ $(ps -o comm= -p "$pid" 2>/dev/null) == systemd-inhibit ]] || return 1
+  printf '%s' "$pid"
+}
+
+seconds_remaining() {
+  [[ -r $DEADLINE_FILE ]] || return 1
+  local deadline
+  deadline=$(<"$DEADLINE_FILE")
+  if [[ $deadline == never ]]; then
+    printf 'never'
+    return 0
+  fi
+  local left=$((deadline - $(date +%s)))
+  ((left < 0)) && left=0
+  printf '%s' "$left"
+}
+
+stop_holder() {
+  local pid=$1
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null && ((waited < 50)); do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  kill -KILL -"$pid" 2>/dev/null || true
+}
+
+run_holder() {
+  local sleep_arg=$1
+  printf '%s\n' "$$" >"$PID_FILE"
+  local -a gnome_wrap=()
+  if [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] && command -v gnome-session-inhibit >/dev/null; then
+    gnome_wrap=(gnome-session-inhibit --inhibit suspend:idle --reason "$INHIBIT_WHY")
+  fi
+  exec systemd-inhibit \
+    --what="$INHIBIT_WHAT" --mode=block --who="$INHIBIT_WHO" --why="$INHIBIT_WHY" \
+    "${gnome_wrap[@]}" sleep "$sleep_arg"
+}
+
+cmd_up() {
+  local duration=$DEFAULT_DURATION
+  while (($#)); do
+    case $1 in
+      --for)
+        [[ -n ${2:-} ]] || die '--for needs a duration'
+        duration=$2
+        shift 2
+        ;;
+      *) die "unknown option '$1' — see: lidawake help" ;;
+    esac
+  done
+
+  local seconds sleep_arg deadline
+  seconds=$(duration_to_seconds "$duration")
+  if ((seconds == 0)); then
+    sleep_arg=infinity
+    deadline=never
+  else
+    sleep_arg=$seconds
+    deadline=$(($(date +%s) + seconds))
+  fi
+
+  mkdir -p "$STATE_DIR"
+
+  local existing
+  if existing=$(holder_pid); then
+    printf 'lidawake: re-arming (previous holder pid %s)\n' "$existing"
+    stop_holder "$existing"
+  fi
+
+  rm -f "$PID_FILE"
+  printf '%s\n' "$deadline" >"$DEADLINE_FILE"
+  setsid --fork "$SELF" __holder "$sleep_arg" </dev/null >/dev/null 2>&1
+
+  local waited=0
+  until holder_pid >/dev/null; do
+    sleep 0.1
+    waited=$((waited + 1))
+    ((waited > 30)) && die 'holder failed to start — run "lidawake doctor" to diagnose'
+  done
+
+  cmd_status
+  printf '\nReminder: lid closed under load restricts airflow on this chassis.\n'
+}
+
+cmd_down() {
+  local pid
+  if ! pid=$(holder_pid); then
+    rm -f "$PID_FILE" "$DEADLINE_FILE"
+    printf 'lidawake: already down\n'
+    return 0
+  fi
+  stop_holder "$pid"
+  rm -f "$PID_FILE" "$DEADLINE_FILE"
+  printf 'lidawake: down — normal suspend behaviour restored\n'
+}
+
+cmd_status() {
+  local pid
+  if ! pid=$(holder_pid); then
+    printf 'lidawake: DOWN\n'
+    printf '  lid close   → suspend (logind HandleLidSwitch=suspend)\n'
+    printf '  battery idle → suspend after %ss\n' \
+      "$(gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout 2>/dev/null || echo '?')"
+    return 1
+  fi
+
+  local left window
+  left=$(seconds_remaining) || left=never
+  if [[ $left == never ]]; then
+    window='no expiry'
+  else
+    window="$(format_seconds "$left") remaining"
+  fi
+
+  printf 'lidawake: UP — pid %s, %s\n' "$pid" "$window"
+  printf '  lid close   → screen off only, machine stays awake\n'
+  printf '  wifi        → stays associated (no suspend, no freeze)\n'
+  if systemd-inhibit --list 2>/dev/null | rg -q "^$INHIBIT_WHO\b"; then
+    printf '  logind      → inhibitor confirmed held\n'
+  else
+    printf '  logind      → WARNING: inhibitor not visible in systemd-inhibit --list\n'
+  fi
+}
+
+cmd_doctor() {
+  printf '== logind lid config ==\n'
+  systemd-analyze cat-config systemd/logind.conf 2>/dev/null |
+    rg -i '^\s*#?\s*(HandleLidSwitch|LidSwitchIgnoreInhibited|IdleAction)' || true
+  printf '\n== gnome idle-suspend ==\n'
+  local key
+  for key in sleep-inactive-ac-type sleep-inactive-ac-timeout \
+    sleep-inactive-battery-type sleep-inactive-battery-timeout; do
+    printf '%-32s %s\n' "$key" \
+      "$(gsettings get org.gnome.settings-daemon.plugins.power "$key" 2>/dev/null || echo '?')"
+  done
+  printf '\n== current inhibitors ==\n'
+  systemd-inhibit --list 2>/dev/null || true
+  printf '\n== recent suspends ==\n'
+  journalctl -b -g 'Suspending\.\.\.|Lid opened|Lid closed' --no-pager -o short-iso 2>/dev/null |
+    tail -10 || true
+}
+
+cmd_help() {
+  cat <<'HELP_TEXT'
+lidawake — keep this laptop awake, and wifi connected, with the lid closed
+
+USAGE
+  lidawake up [--for DURATION]   hold the mode (default 2h)
+  lidawake down                  release it
+  lidawake status                state + time left (exit 0 = up, 1 = down)
+  lidawake doctor                dump suspend config and recent history
+  lidawake help                  this text
+
+  DURATION: 90s | 30m | 2h | 1d | 0 (no expiry)
+
+WHY THIS EXISTS
+  Closing the lid was never a wifi problem — it suspended the whole machine.
+  The kernel freezes all userspace on suspend, so wifi drops and every
+  long-running job stops at the same instant.
+
+  This laptop has two independent suspend triggers:
+
+    lid close               systemd-logind, HandleLidSwitch=suspend
+    15 min idle on battery  gnome-settings-daemon, sleep-inactive-battery-type
+
+  One command has to block both. That is why there are two inhibitors.
+
+HOW IT WORKS
+  "up" spawns a detached holder in its own session:
+
+    systemd-inhibit --what=handle-lid-switch:sleep:idle --mode=block
+      └─ gnome-session-inhibit --inhibit suspend:idle
+           └─ sleep <duration>
+
+  handle-lid-switch      stops logind acting on the lid switch
+  gnome-session-inhibit  stops gsd-power's battery idle-suspend, which logind
+                         inhibitors do NOT cover, because GNOME calls
+                         Suspend() itself rather than going through logind's
+                         idle path
+
+  Both are held by open file descriptors, not by config. They release the
+  moment the holder exits — down, timer expiry, kill, crash, or reboot. So the
+  mode fails safe: nothing persistent, no root, nothing to un-break by hand.
+
+  The holder is deliberately its own session leader (PGID == SID == PID), so
+  closing a tmux pane or terminal cannot SIGHUP it.
+
+  State lives in $XDG_RUNTIME_DIR/lidawake/ — tmpfs, self-clears on reboot.
+
+THE GOTCHA WORTH REMEMBERING
+  LidSwitchIgnoreInhibited=yes is the logind default. It means a plain
+  --what=sleep inhibitor is IGNORED on lid close, so the obvious approach
+  fails silently. handle-lid-switch is honoured regardless of that setting,
+  which is why it is the one used here.
+
+CAVEATS
+  Deliberate suspend is blocked too, because of the :sleep component. Run
+  "lidawake down" first, or "systemctl suspend -i" to override. Remove :sleep
+  from INHIBIT_WHAT if you would rather keep manual suspend working.
+
+  Lid closed under sustained load restricts airflow on this chassis.
+
+  "--for 0" never expires; a forgotten mode will flatten the battery. The 2h
+  default exists for exactly that reason.
+HELP_TEXT
+}
+
+case ${1:-status} in
+  __holder)
+    shift
+    run_holder "$@"
+    ;;
+  up)
+    shift
+    cmd_up "$@"
+    ;;
+  down) cmd_down ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  help | -h | --help) cmd_help ;;
+  *) die "unknown command '${1}' — see: lidawake help" ;;
+esac
