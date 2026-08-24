@@ -43,6 +43,8 @@ Selection (one required):
 
 Options:
       --skip-dev          Skip all 'dev' targets for this run
+      --approve           Cast an 'approve' vote on each PR the run creates,
+                          and on active PRs it finds already open
       --no-auto-complete  Disable auto-complete (default: on)
                           Auto-complete keeps source branch, no squash, no bypass
   -j, --concurrency N  Parallel PR workers (default 6, max 20)
@@ -58,6 +60,7 @@ SELECTION_MODE=""
 SKIP_DEV_CLI=false
 DRY_RUN=false
 AUTO_COMPLETE=true
+APPROVE=false
 CONCURRENCY=6
 
 parse_repo_list() {
@@ -84,6 +87,8 @@ while [[ $# -gt 0 ]]; do
         -r=*|--repo=*) SELECTION_MODE="filter"; parse_repo_list "${1#*=}"; shift ;;
         -f|--pick)     SELECTION_MODE="pick"; shift ;;
         --skip-dev)         SKIP_DEV_CLI=true; shift ;;
+        --approve)          APPROVE=true; shift ;;
+        --no-approve)       APPROVE=false; shift ;;
         --auto-complete)    AUTO_COMPLETE=true; shift ;;
         --no-auto-complete) AUTO_COMPLETE=false; shift ;;
         -j|--concurrency)      CONCURRENCY="$2"; shift 2 ;;
@@ -253,6 +258,34 @@ create_backmerge_pr() {
         "${ac_args[@]}" 2>&1
 }
 
+approve_pr() {
+    local pr_id="$1"
+    az repos pr set-vote \
+        --organization "$ADO_ORG" \
+        --id "$pr_id" \
+        --vote approve \
+        --output none 2>&1
+}
+
+# Echoes a message suffix describing the vote; empty unless --approve is set
+approve_note() {
+    local pr_id="$1"
+    [[ "${APPROVE:-false}" == "true" ]] || return 0
+
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        echo " would approve"
+        return 0
+    fi
+
+    local out ec=0
+    out="$(approve_pr "$pr_id")" || ec=$?
+    if [[ $ec -eq 0 ]]; then
+        echo " approved"
+    else
+        echo " approve failed: $(echo "$out" | tr '\n|' '  ' | tr -s ' ' | cut -c1-120)"
+    fi
+}
+
 # Echoes a single line: status|pr_url|message
 process_pair() {
     local repo="$1" source="$2" target="$3"
@@ -271,7 +304,7 @@ process_pair() {
     existing_pr_id="$(find_active_pr_id "$repo" "$source" "$target")"
     if [[ -n "$existing_pr_id" ]]; then
         url="$(build_pr_url "$repo" "$existing_pr_id")"
-        echo "EXISTS|$url|PR #$existing_pr_id"
+        echo "EXISTS|$url|PR #$existing_pr_id$(approve_note "$existing_pr_id")"
         return
     fi
 
@@ -281,7 +314,9 @@ process_pair() {
     fi
 
     if [[ "$DRY_RUN" == true ]]; then
-        echo "DRY_RUN||would create $source -> $target"
+        local plan="would create $source -> $target"
+        [[ "${APPROVE:-false}" == "true" ]] && plan="$plan and approve"
+        echo "DRY_RUN||$plan"
         return
     fi
 
@@ -301,7 +336,7 @@ process_pair() {
         race_pr_id="$(find_active_pr_id "$repo" "$source" "$target")"
         if [[ -n "$race_pr_id" ]]; then
             url="$(build_pr_url "$repo" "$race_pr_id")"
-            echo "EXISTS|$url|PR #$race_pr_id"
+            echo "EXISTS|$url|PR #$race_pr_id$(approve_note "$race_pr_id")"
             return
         fi
 
@@ -324,12 +359,15 @@ process_pair() {
 
     url="$(build_pr_url "$repo" "$pr_id")"
 
+    local vote_note
+    vote_note="$(approve_note "$pr_id")"
+
     case "$merge_status" in
-        conflicts)              echo "CREATED_CONFLICT|$url|PR #$pr_id merge conflicts" ;;
+        conflicts)              echo "CREATED_CONFLICT|$url|PR #$pr_id merge conflicts$vote_note" ;;
         succeeded|succeededNonFastForward)
-                                echo "CREATED|$url|PR #$pr_id" ;;
-        rejectedByPolicy)       echo "CREATED_CONFLICT|$url|PR #$pr_id rejected by policy" ;;
-        *)                      echo "CREATED|$url|PR #$pr_id" ;;
+                                echo "CREATED|$url|PR #$pr_id$vote_note" ;;
+        rejectedByPolicy)       echo "CREATED_CONFLICT|$url|PR #$pr_id rejected by policy$vote_note" ;;
+        *)                      echo "CREATED|$url|PR #$pr_id$vote_note" ;;
     esac
 }
 
@@ -393,8 +431,8 @@ if [[ ${#JOBS[@]} -gt 0 ]]; then
     (( effective_concurrency > ${#JOBS[@]} )) && effective_concurrency=${#JOBS[@]}
     info "Dispatching ${#JOBS[@]} PR job(s) with concurrency $effective_concurrency"
 
-    export ADO_ORG ADO_PROJECT DEFAULT_REVIEWERS PR_TITLE_TEMPLATE TODAY DRY_RUN AUTO_COMPLETE
-    export -f build_pr_url branch_exists find_active_pr_id has_commits_to_merge render_title create_backmerge_pr process_pair
+    export ADO_ORG ADO_PROJECT DEFAULT_REVIEWERS PR_TITLE_TEMPLATE TODAY DRY_RUN AUTO_COMPLETE APPROVE
+    export -f build_pr_url branch_exists find_active_pr_id has_commits_to_merge render_title create_backmerge_pr approve_pr approve_note process_pair
 
     parallel_out="$(mktemp)"
     trap 'rm -f "$parallel_out"' EXIT
