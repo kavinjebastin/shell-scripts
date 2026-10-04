@@ -15,14 +15,22 @@ require_root
 require_cmd curl
 require_cmd unzip
 
+FPC_SENSOR_ID="10a5:9800"
+ELAN_SENSOR_ID="04f3:0c4b"
 DRIVER_URL="https://download.lenovo.com/pccbbs/mobiles/r1slm02w.zip"
-DRIVER_ZIP="/tmp/r1slm02w.zip"
-EXTRACT_DIR="/tmp/fpc_fingerprint_driver"
+DRIVER_SHA256="e725be53da4a6235b9621289386c44ecacb8d03a52c2d56d69904525fe6f7f3f"
 LIB_DIR="/usr/lib/x86_64-linux-gnu"
+TARGET_USER="${SUDO_USER:-$(logname)}"
+WORK_DIR="$(mktemp -d)"
+DRIVER_ZIP="$WORK_DIR/r1slm02w.zip"
+EXTRACT_DIR="$WORK_DIR/fpc_fingerprint_driver"
 
-if ! lsusb | grep -q "10a5:9800"; then
-    error "FPC fingerprint sensor (10a5:9800) not found"
+if ! lsusb | grep -q "$FPC_SENSOR_ID"; then
+    error "FPC fingerprint sensor ($FPC_SENSOR_ID) not found"
     error "This script is for Lenovo ThinkPad E14/E15 Gen 4 with FPC sensor"
+    if lsusb | grep -q "$ELAN_SENSOR_ID"; then
+        error "ELAN sensor ($ELAN_SENSOR_ID) detected — use setup-fingerprint-thinkpad-e14-gen3.sh instead"
+    fi
     exit 1
 fi
 success "FPC fingerprint sensor detected"
@@ -32,8 +40,9 @@ apt-get install -y -qq libfprint-2-tod1 fprintd libpam-fprintd
 
 info "Downloading FPC driver from Lenovo..."
 curl -fsSL -o "$DRIVER_ZIP" "$DRIVER_URL"
-mkdir -p "$EXTRACT_DIR"
-unzip -o "$DRIVER_ZIP" -d "$EXTRACT_DIR"
+echo "$DRIVER_SHA256  $DRIVER_ZIP" | sha256sum -c --quiet -
+success "Driver checksum verified"
+unzip -q -o "$DRIVER_ZIP" -d "$EXTRACT_DIR"
 
 info "Installing FPC proprietary library..."
 cp "$EXTRACT_DIR/FPC_driver_linux_27.26.23.39/install_fpc/libfpcbep.so" "$LIB_DIR/"
@@ -43,20 +52,24 @@ cp -r "$EXTRACT_DIR/FPC_driver_linux_libfprint/install_libfprint/lib/"* /lib/
 cp -r "$EXTRACT_DIR/FPC_driver_linux_libfprint/install_libfprint/usr/"* /usr/
 mkdir -p /var/log/fpc
 chmod 755 "$LIB_DIR/libfprint-2.so.2.0.0"
+ldconfig
 
 info "Holding libfprint-2-2 package to prevent apt from overwriting..."
-echo "libfprint-2-2 hold" | dpkg --set-selections
+apt-mark hold libfprint-2-2
 
 info "Reloading udev rules and restarting fprintd..."
 udevadm control --reload-rules
 udevadm trigger
 systemctl restart fprintd.service
 
+info "Enabling fingerprint authentication in PAM..."
+pam-auth-update --enable fprintd
+
 info "Cleaning up temporary files..."
-rm -rf "$DRIVER_ZIP" "$EXTRACT_DIR"
+rm -rf "$WORK_DIR"
 
 info "Verifying device detection..."
-if fprintd-list "$(logname)" 2>&1 | grep -q "FPC Sensor Controller"; then
+if fprintd-list "$TARGET_USER" 2>&1 | grep -q "FPC Sensor Controller"; then
     success "FPC fingerprint sensor is ready"
     info "Enroll your fingerprint via Settings > Users > Fingerprint Login"
     info "or run: fprintd-enroll"
